@@ -1,0 +1,107 @@
+<!-- public/room.html -->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+
+    <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>IPChat</title>
+
+    <link rel="stylesheet" href="style.css">
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2280%22>💬</text></svg>">
+
+    <script src="/socket.io/socket.io.js"></script>
+
+</head>
+<body>
+
+<!-- Premium Loading Overlay -->
+<div id="loadingOverlay" class="loading-overlay">
+    <div class="spinner"></div>
+    <div class="loading-text">Joining Room...</div>
+</div>
+
+<!-- Mobile Sidebar Drawer Backdrop Overlay -->
+<div id="sidebarOverlay" class="sidebar-overlay"></div>
+
+<div class="main-layout">
+
+    <div class="sidebar">
+
+        <h3>Online</h3>
+
+        <div id="onlineUsers"></div>
+
+        <div id="adminPanel" class="admin-panel hidden">
+            <div class="admin-panel-title">🛡 Admin Controls</div>
+            <div class="admin-panel-subtitle">Blocked users</div>
+            <div id="blockedUsers" class="blocked-users"></div>
+        </div>
+
+        <!-- Subtle Credit Footer -->
+        <div class="footer-credit">Developed by Mohit</div>
+
+    </div>
+
+    <div class="chat-container">
+
+        <!-- Slide-down Connection Status Banner -->
+        <div id="connectionStatus" class="connection-status">Reconnecting to server...</div>
+
+        <div class="topbar">
+
+            <div class="topbar-left">
+                <!-- Mobile Drawer Toggle Burger Button -->
+                <button id="toggleSidebarBtn" class="toggle-sidebar-btn">☰</button>
+                <h4 id="roomTitle"></h4>
+            </div>
+
+            <!-- Red Glassmorphic Clear Chat Button -->
+            <button id="clearChatBtn" class="clear-chat-btn hidden">🗑 Clear Chat</button>
+
+        </div>
+
+        <div id="messages" class="messages"></div>
+
+        <div id="typing" class="typing"></div>
+
+        <div class="input-area">
+
+            <textarea
+                id="messageInput"
+                placeholder="Type message..."
+                maxlength="1000"
+            ></textarea>
+
+            <button id="sendBtn">
+                Send
+            </button>
+
+        </div>
+
+    </div>
+
+</div>
+
+<!-- Glassmorphic Confirmation Modal -->
+<div id="clearModal" class="modal-overlay">
+    <div class="modal-card">
+        <h3 class="modal-title">Clear Room Chat?</h3>
+        <p class="modal-text">Are you sure you want to clear this chat? This will permanently delete all messages for everyone in this room.</p>
+        <div class="modal-actions">
+            <button id="modalCancelBtn" class="modal-btn cancel-btn">Cancel</button>
+            <button id="modalConfirmBtn" class="modal-btn confirm-btn">Clear Chat</button>
+        </div>
+    </div>
+</div>
+
+<script src="js/room.js"></script>
+
+</body>
+</html>
