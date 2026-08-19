@@ -1,72 +1,98 @@
-// server.js
-
 require("dotenv").config();
 
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const { Pool } = require("pg");
-const crypto = require("crypto");
 
 const app = express();
 app.disable("x-powered-by");
-
 const server = http.createServer(app);
 const io = new Server(server);
-
 app.use(express.static("public", { maxAge: "1d" }));
 
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
+    ssl: { rejectUnauthorized: false },
+    connectionTimeoutMillis: 10000,
+    idleTimeoutMillis: 30000
 });
 
-/*
- * Room structure:
- * roomUsers[roomId] = {
- *   adminId: "persistent client id",
- *   users: [{ id, username, socketId, role }],
- *   blocked: Set([clientId])
- * }
- */
-const roomUsers = {};
-
+const roomUsers = {}; // roomId -> [{ socketId, clientId, username, role }]
+const rateLimiter = {};
 const usernameRegex = /^[a-zA-Z0-9_ -]{1,20}$/;
 const roomRegex = /^[a-zA-Z0-9_-]{1,20}$/;
-const clientIdRegex = /^[a-f0-9-]{20,80}$/i;
-
-function sanitizeInput(str) {
-    if (typeof str !== "string") return "";
-    return str;
-}
-
-const rateLimiter = {};
+const clientIdRegex = /^[a-zA-Z0-9_-]{8,100}$/;
 let dbConnected = false;
 
-pool.connect()
-    .then(() => {
+async function initDatabase() {
+    try {
+        await pool.query("SELECT 1");
         dbConnected = true;
         console.log("Database connected");
-    })
-    .catch((err) => {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS room_blocks (
+                room_code TEXT NOT NULL,
+                client_id TEXT NOT NULL,
+                blocked_at TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (room_code, client_id)
+            )
+        `);
+        console.log("room_blocks table ready");
+    } catch (err) {
         dbConnected = false;
-        console.log("Database connection failed. Continuing in local-only mode. Error:", err.message);
+        console.error("Database unavailable:", err.message);
+    }
+}
+initDatabase();
+
+function clean(value) {
+    return typeof value === "string" ? value.trim() : "";
+}
+
+async function isBlocked(roomId, clientId) {
+    if (!dbConnected) return false;
+    try {
+        const result = await pool.query(
+            "SELECT 1 FROM room_blocks WHERE room_code = $1 AND client_id = $2 LIMIT 1",
+            [roomId, clientId]
+        );
+        return result.rowCount > 0;
+    } catch (err) {
+        console.error("Block check failed:", err.message);
+        return false;
+    }
+}
+
+function getRoomUsers(roomId) {
+    return (roomUsers[roomId] || []).map(u => ({
+        clientId: u.clientId,
+        username: u.username,
+        role: u.role
+    }));
+}
+
+function broadcastRoomState(roomId) {
+    const users = getRoomUsers(roomId);
+    io.to(roomId).emit("room-state", {
+        users,
+        adminClientId: users.find(u => u.role === "admin")?.clientId || null
     });
+    io.to(roomId).emit("user-list", users.map(u => u.username));
+}
+
+function findUser(roomId, clientId) {
+    return (roomUsers[roomId] || []).find(u => u.clientId === clientId);
+}
 
 app.get("/messages/:room", async (req, res) => {
     try {
-        if (!dbConnected) return res.json([]);
-
         const room = req.params.room;
         if (!roomRegex.test(room)) return res.status(400).json([]);
-
         const result = await pool.query(
-            `SELECT * FROM messages
-             WHERE room_code = $1
-             ORDER BY created_at ASC`,
+            `SELECT * FROM messages WHERE room_code = $1 ORDER BY created_at ASC`,
             [room]
         );
-
         res.json(result.rows);
     } catch (err) {
         console.error("Database query failed:", err.message);
@@ -74,386 +100,200 @@ app.get("/messages/:room", async (req, res) => {
     }
 });
 
-app.get("/", (req, res) => {
-    res.send("IPChat running");
-});
-
-function getRoomUsers(roomId) {
-    return roomUsers[roomId]?.users || [];
-}
-
-function publicUserList(roomId) {
-    return getRoomUsers(roomId).map((user) => ({
-        id: user.id,
-        username: user.username,
-        role: user.role
-    }));
-}
-
-function broadcastUserList(roomId) {
-    io.to(roomId).emit("user-list", publicUserList(roomId));
-}
-
-function findUser(roomId, userId) {
-    return getRoomUsers(roomId).find((user) => user.id === userId);
-}
-
-function isAdmin(socket, roomId = socket.roomId) {
-    return Boolean(
-        roomId &&
-        roomUsers[roomId] &&
-        socket.clientUserId &&
-        roomUsers[roomId].adminId === socket.clientUserId
-    );
-}
-
-function emitAdminError(socket, message) {
-    socket.emit("admin-error", message);
-}
+app.get("/", (req, res) => res.send("IPChat running"));
 
 io.on("connection", (socket) => {
-    console.log("User connected");
+    console.log("User connected", socket.id);
 
-    socket.on("join-room", (data) => {
+    socket.on("join-room", async (data) => {
         if (!data || !data.roomId || !data.username || !data.clientId) {
-            socket.emit("join-failure", "Room ID, Username and Client ID are required.");
+            socket.emit("join-failure", "Room ID, Username and client ID are required.");
             return;
         }
 
-        const cleanRoomId = String(data.roomId).trim();
-        const cleanUsername = String(data.username).trim();
-        const cleanClientId = String(data.clientId).trim();
+        const roomId = clean(data.roomId);
+        const username = clean(data.username);
+        const clientId = clean(data.clientId);
 
-        if (!roomRegex.test(cleanRoomId)) {
-            socket.emit("join-failure", "Room ID must be 1-20 characters (letters, numbers, underscores, dashes).");
-            return;
+        if (!roomRegex.test(roomId)) {
+            socket.emit("join-failure", "Invalid Room ID."); return;
+        }
+        if (!usernameRegex.test(username)) {
+            socket.emit("join-failure", "Invalid Username."); return;
+        }
+        if (!clientIdRegex.test(clientId)) {
+            socket.emit("join-failure", "Invalid client ID."); return;
         }
 
-        if (!usernameRegex.test(cleanUsername)) {
-            socket.emit("join-failure", "Username must be 1-20 characters (letters, numbers, spaces, underscores, dashes).");
-            return;
-        }
-
-        if (!clientIdRegex.test(cleanClientId)) {
-            socket.emit("join-failure", "Invalid client ID.");
-            return;
-        }
-
-        if (!roomUsers[cleanRoomId]) {
-            roomUsers[cleanRoomId] = {
-                adminId: cleanClientId,
-                users: [],
-                blocked: new Map()
-            };
-        }
-
-        const room = roomUsers[cleanRoomId];
-
-        // A block applies to this room only.
-        if (room.blocked.has(cleanClientId)) {
+        if (await isBlocked(roomId, clientId)) {
             socket.emit("join-failure", "You are blocked from this room.");
             return;
         }
 
-        // Same client cannot have two active connections in the same room.
-        if (room.users.some((u) => u.id === cleanClientId)) {
-            socket.emit("join-failure", "You are already connected to this room.");
+        if (!roomUsers[roomId]) roomUsers[roomId] = [];
+
+        if (roomUsers[roomId].some(u => u.clientId === clientId)) {
+            socket.emit("join-failure", "This browser is already connected to this room.");
             return;
         }
-
-        // Check duplicate username in this room.
-        if (room.users.some((u) => u.username.toLowerCase() === cleanUsername.toLowerCase())) {
+        if (roomUsers[roomId].some(u => u.username.toLowerCase() === username.toLowerCase())) {
             socket.emit("join-failure", "Username is already taken in this room.");
             return;
         }
 
-        const role = room.adminId === cleanClientId ? "admin" : "member";
-
-        const user = {
-            id: cleanClientId,
-            username: cleanUsername,
-            socketId: socket.id,
-            role
-        };
-
-        room.users.push(user);
-
-        socket.join(cleanRoomId);
-        socket.roomId = cleanRoomId;
-        socket.username = cleanUsername;
-        socket.clientUserId = cleanClientId;
+        const role = roomUsers[roomId].length === 0 ? "admin" : "member";
+        const user = { socketId: socket.id, clientId, username, role };
+        roomUsers[roomId].push(user);
+        socket.join(roomId);
+        socket.roomId = roomId;
+        socket.username = username;
+        socket.clientId = clientId;
         socket.role = role;
 
-        socket.emit("room-state", {
-            role,
-            userId: cleanClientId
-        });
-
-        if (role === "admin") {
-            socket.emit("blocked-list", Array.from(room.blocked, ([id, username]) => ({ id, username })));
-        }
-
-        broadcastUserList(cleanRoomId);
-
-        socket.to(cleanRoomId).emit("system-message", `${cleanUsername} joined`);
-        console.log(`${cleanUsername} joined ${cleanRoomId} as ${role}`);
+        socket.emit("join-success", { role, clientId });
+        broadcastRoomState(roomId);
+        socket.to(roomId).emit("system-message", `${username} joined`);
+        console.log(`${username} joined ${roomId} as ${role}`);
     });
 
     socket.on("typing", (data) => {
         if (!socket.roomId || !socket.username) return;
-
         socket.to(socket.roomId).emit("typing", {
             username: socket.username,
-            isTyping: Boolean(data?.isTyping)
+            isTyping: !!data?.isTyping
         });
     });
 
     socket.on("send-message", async (data) => {
         try {
-            if (!socket.roomId || !socket.username) return;
-            if (!data || typeof data.message !== "string") return;
-
-            const rawMessage = data.message.trim();
+            if (!socket.roomId || !socket.username || !data?.message) return;
+            const rawMessage = clean(data.message);
             if (!rawMessage) return;
 
             const now = Date.now();
             if (!rateLimiter[socket.id]) rateLimiter[socket.id] = [];
-
-            rateLimiter[socket.id] = rateLimiter[socket.id].filter((t) => now - t < 3000);
-
+            rateLimiter[socket.id] = rateLimiter[socket.id].filter(t => now - t < 3000);
             if (rateLimiter[socket.id].length >= 5) {
                 socket.emit("system-message", "You are sending messages too fast.");
                 return;
             }
-
             rateLimiter[socket.id].push(now);
 
-            const limitedMessage = rawMessage.substring(0, 1000);
-            const sanitizedMessage = sanitizeInput(limitedMessage);
-            const roomId = socket.roomId;
-            const sender = socket.username;
-
-            io.to(roomId).emit("receive-message", {
-                sender,
-                message: sanitizedMessage
+            const message = rawMessage.substring(0, 1000);
+            io.to(socket.roomId).emit("receive-message", {
+                sender: socket.username,
+                message
             });
 
-            if (dbConnected) {
-                try {
-                    await pool.query(
-                        `INSERT INTO messages (room_code, sender, message)
-                         VALUES ($1, $2, $3)`,
-                        [roomId, sender, sanitizedMessage]
-                    );
-                } catch (dbErr) {
-                    console.error("Database insert failed:", dbErr.message);
-                }
+            try {
+                await pool.query(
+                    `INSERT INTO messages (room_code, sender, message) VALUES ($1, $2, $3)`,
+                    [socket.roomId, socket.username, message]
+                );
+            } catch (dbErr) {
+                console.error("Database insert failed:", dbErr.message);
             }
-        } catch (err) {
-            console.log(err);
-        }
+        } catch (err) { console.error(err); }
     });
 
-    // ADMIN: kick a user. They may rejoin later.
-    socket.on("kick-user", (data) => {
-        const roomId = socket.roomId;
-        const targetId = data?.userId;
-
-        if (!isAdmin(socket)) {
-            emitAdminError(socket, "Only the room admin can kick users.");
-            return;
-        }
-
-        if (!targetId || targetId === socket.clientUserId) {
-            emitAdminError(socket, "You cannot kick yourself.");
-            return;
-        }
-
-        const target = findUser(roomId, targetId);
-        if (!target) {
-            emitAdminError(socket, "User is no longer in the room.");
-            return;
-        }
-
-        const targetSocket = io.sockets.sockets.get(target.socketId);
-        if (!targetSocket) return;
-
-        targetSocket.emit("kicked", "You were kicked from this room by the admin.");
-        targetSocket.disconnect(true);
-
-        console.log(`[ADMIN] ${socket.username} kicked ${target.username} from ${roomId}`);
-    });
-
-    // ADMIN: block a user. The block lasts while this room exists.
-    socket.on("block-user", (data) => {
-        const roomId = socket.roomId;
-        const targetId = data?.userId;
-
-        if (!isAdmin(socket)) {
-            emitAdminError(socket, "Only the room admin can block users.");
-            return;
-        }
-
-        if (!targetId || targetId === socket.clientUserId) {
-            emitAdminError(socket, "You cannot block yourself.");
-            return;
-        }
-
-        const room = roomUsers[roomId];
-        const target = findUser(roomId, targetId);
-
-        if (!target) {
-            emitAdminError(socket, "User is no longer in the room.");
-            return;
-        }
-
-        room.blocked.set(target.id, target.username);
-
-        const targetSocket = io.sockets.sockets.get(target.socketId);
-        if (targetSocket) {
-            targetSocket.emit("blocked", "You were blocked from this room by the admin.");
-            targetSocket.disconnect(true);
-        }
-
-        socket.emit("blocked-list", Array.from(room.blocked, ([id, username]) => ({ id, username })));
-        console.log(`[ADMIN] ${socket.username} blocked ${target.username} from ${roomId}`);
-    });
-
-    // ADMIN: unblock a previously blocked client ID.
-    socket.on("unblock-user", (data) => {
-        const roomId = socket.roomId;
-        const targetId = data?.userId;
-
-        if (!isAdmin(socket)) {
-            emitAdminError(socket, "Only the room admin can unblock users.");
-            return;
-        }
-
-        if (!targetId) {
-            emitAdminError(socket, "Invalid user ID.");
-            return;
-        }
-
-        const room = roomUsers[roomId];
-        if (!room.blocked.has(targetId)) {
-            emitAdminError(socket, "That user is not blocked.");
-            return;
-        }
-
-        room.blocked.delete(targetId);
-        socket.emit("blocked-list", Array.from(room.blocked, ([id, username]) => ({ id, username })));
-        socket.emit("admin-notice", "User has been unblocked. They can join the room again.");
-        console.log(`[ADMIN] ${socket.username} unblocked ${targetId} in ${roomId}`);
-    });
-
-    // ADMIN ONLY: clear chat.
     socket.on("clear-chat", async () => {
         try {
-            const roomId = socket.roomId;
-            if (!roomId || !isAdmin(socket)) {
-                emitAdminError(socket, "Only the room admin can clear the chat.");
+            if (!socket.roomId || socket.role !== "admin") {
+                socket.emit("admin-error", "Only the room admin can clear chat.");
                 return;
             }
-
-            if (dbConnected) {
-                try {
-                    await pool.query("DELETE FROM messages WHERE room_code = $1", [roomId]);
-                } catch (dbErr) {
-                    console.error(`[Clear Chat Failed DB] ${roomId}`, dbErr.message);
-                    socket.emit("system-message", "Failed to clear chat.");
-                    return;
-                }
-            }
-
-            io.to(roomId).emit("chat-cleared");
-            console.log(`[ADMIN] ${socket.username} cleared chat in ${roomId}`);
+            await pool.query("DELETE FROM messages WHERE room_code = $1", [socket.roomId]);
+            io.to(socket.roomId).emit("chat-cleared");
         } catch (err) {
-            console.log(err);
+            console.error("Clear chat failed:", err.message);
+            socket.emit("admin-error", "Could not clear chat.");
+        }
+    });
+
+    socket.on("admin-kick", (data) => {
+        if (socket.role !== "admin" || !socket.roomId) return;
+        const target = findUser(socket.roomId, clean(data?.clientId));
+        if (!target || target.clientId === socket.clientId || target.role === "admin") return;
+        const targetSocket = io.sockets.sockets.get(target.socketId);
+        if (targetSocket) {
+            targetSocket.emit("kicked", "You were kicked from this room by the admin.");
+            targetSocket.disconnect(true);
+        }
+    });
+
+    socket.on("admin-block", async (data) => {
+        if (socket.role !== "admin" || !socket.roomId) return;
+        const target = findUser(socket.roomId, clean(data?.clientId));
+        if (!target || target.clientId === socket.clientId || target.role === "admin") return;
+        try {
+            await pool.query(
+                `INSERT INTO room_blocks (room_code, client_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+                [socket.roomId, target.clientId]
+            );
+            const targetSocket = io.sockets.sockets.get(target.socketId);
+            if (targetSocket) {
+                targetSocket.emit("blocked", "You were blocked from this room by the admin.");
+                targetSocket.disconnect(true);
+            }
+        } catch (err) {
+            console.error("Block failed:", err.message);
+            socket.emit("admin-error", "Could not block that user.");
+        }
+    });
+
+    socket.on("admin-unblock", async (data) => {
+        if (socket.role !== "admin" || !socket.roomId) return;
+        const clientId = clean(data?.clientId);
+        if (!clientId) return;
+        try {
+            await pool.query(
+                "DELETE FROM room_blocks WHERE room_code = $1 AND client_id = $2",
+                [socket.roomId, clientId]
+            );
+            socket.emit("admin-info", "User unblocked. They can join this room again.");
+        } catch (err) {
+            console.error("Unblock failed:", err.message);
+            socket.emit("admin-error", "Could not unblock that user.");
+        }
+    });
+
+    socket.on("admin-get-blocks", async () => {
+        if (socket.role !== "admin" || !socket.roomId) return;
+        try {
+            const result = await pool.query(
+                "SELECT client_id FROM room_blocks WHERE room_code = $1 ORDER BY blocked_at DESC",
+                [socket.roomId]
+            );
+            socket.emit("blocked-list", result.rows.map(r => r.client_id));
+        } catch (err) {
+            socket.emit("admin-error", "Could not load blocked users.");
         }
     });
 
     socket.on("disconnect", () => {
         const roomId = socket.roomId;
-        const username = socket.username;
-        const clientUserId = socket.clientUserId;
+        if (rateLimiter[socket.id]) delete rateLimiter[socket.id];
+        if (!roomId || !roomUsers[roomId]) return;
 
-        delete rateLimiter[socket.id];
+        socket.to(roomId).emit("typing", { username: socket.username, isTyping: false });
+        const index = roomUsers[roomId].findIndex(u => u.socketId === socket.id);
+        if (index === -1) return;
+        const wasAdmin = roomUsers[roomId][index].role === "admin";
+        const username = roomUsers[roomId][index].username;
+        roomUsers[roomId].splice(index, 1);
 
-        if (!roomId || !roomUsers[roomId]) {
-            console.log("User disconnected");
-            return;
-        }
-
-        const room = roomUsers[roomId];
-
-        socket.to(roomId).emit("typing", {
-            username,
-            isTyping: false
-        });
-
-        room.users = room.users.filter((user) => user.socketId !== socket.id);
-
-        // If the admin leaves, promote the first remaining user.
-        if (room.adminId === clientUserId && room.users.length > 0) {
-            const newAdmin = room.users[0];
-            room.adminId = newAdmin.id;
-            newAdmin.role = "admin";
-
-            const newAdminSocket = io.sockets.sockets.get(newAdmin.socketId);
-            if (newAdminSocket) {
-                newAdminSocket.role = "admin";
-                newAdminSocket.emit("room-state", {
-                    role: "admin",
-                    userId: newAdmin.id
-                });
-                newAdminSocket.emit("blocked-list", Array.from(room.blocked, ([id, username]) => ({ id, username })));
-            }
-
-            io.to(roomId).emit("system-message", `${newAdmin.username} is now the room admin`);
-            console.log(`[ADMIN] ${newAdmin.username} promoted in ${roomId}`);
-        }
-
-        if (room.users.length > 0) {
-            broadcastUserList(roomId);
-            socket.to(roomId).emit("system-message", `${username} left`);
-        } else {
+        if (roomUsers[roomId].length === 0) {
             delete roomUsers[roomId];
-            console.log(`[Room Cleanup] Memory cleaned for room: ${roomId}`);
-
-            if (dbConnected) {
-                pool.query("DELETE FROM messages WHERE room_code = $1", [roomId])
-                    .then(() => console.log(`[Room Cleanup] Messages deleted for ${roomId}`))
-                    .catch((dbErr) => console.error(`[Room Cleanup] DB cleanup failed for ${roomId}`, dbErr.message));
-            }
+        } else {
+            if (wasAdmin) roomUsers[roomId][0].role = "admin";
+            broadcastRoomState(roomId);
+            socket.to(roomId).emit("system-message", `${username} left`);
         }
-
-        console.log("User disconnected");
+        console.log(`${username} disconnected from ${roomId}`);
     });
 });
 
-app.use((req, res) => {
-    res.status(404).send(`
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>404 - Page Not Found | IPChat</title>
-            <link rel="stylesheet" href="/style.css">
-        </head>
-        <body>
-            <div class="container error-container">
-                <h1 class="error-code">404</h1>
-                <h2>Page Not Found</h2>
-                <p class="error-desc">The room or page you are looking for does not exist or has been moved.</p>
-                <a href="/" class="home-btn">Return Home</a>
-            </div>
-        </body>
-        </html>
-    `);
-});
+app.use((req, res) => res.status(404).send("404 - Page Not Found"));
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`IPChat running on port ${PORT}`);
-});
+server.listen(PORT, "0.0.0.0", () => console.log(`IPChat running on port ${PORT}`));
