@@ -630,6 +630,24 @@ button{
     margin-bottom: 15px;
 }
 
+/* Instagram credit */
+.instagram-credit {
+    display: block;
+    font-size: 14px;
+    font-weight: 500;
+    color: rgba(255, 255, 255, 0.45);
+    text-align: center;
+    text-decoration: none;
+    letter-spacing: 0.3px;
+    margin-top: 10px;
+    transition: color 0.3s ease, text-shadow 0.3s ease;
+}
+
+.instagram-credit:hover {
+    color: rgba(255, 255, 255, 0.9);
+    text-shadow: 0 0 10px rgba(255, 80, 120, 0.55);
+}
+
 /* Subtle Credit Footer styling */
 .footer-credit {
     font-size: 16px;
