@@ -18,11 +18,16 @@ const pool = new Pool({
     idleTimeoutMillis: 30000
 });
 
-const roomUsers = {}; // roomId -> [{ socketId, clientId, username, role }]
+// roomId -> [{ socketId, clientId, username, role }]
+const roomUsers = {};
+const emptyRoomTimers = {};
 const rateLimiter = {};
+
 const usernameRegex = /^[a-zA-Z0-9_ -]{1,20}$/;
 const roomRegex = /^[a-zA-Z0-9_-]{1,20}$/;
 const clientIdRegex = /^[a-zA-Z0-9_-]{8,100}$/;
+
+const EMPTY_ROOM_CLEAR_MS = 5 * 60 * 1000;
 let dbConnected = false;
 
 async function initDatabase() {
@@ -30,6 +35,7 @@ async function initDatabase() {
         await pool.query("SELECT 1");
         dbConnected = true;
         console.log("Database connected");
+
         await pool.query(`
             CREATE TABLE IF NOT EXISTS room_blocks (
                 room_code TEXT NOT NULL,
@@ -38,12 +44,47 @@ async function initDatabase() {
                 PRIMARY KEY (room_code, client_id)
             )
         `);
-        console.log("room_blocks table ready");
+
+        // Permanent room ownership. The owner is identified by the
+        // anonymous clientId stored in that browser's localStorage.
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS room_owners (
+                room_code TEXT PRIMARY KEY,
+                owner_client_id TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                empty_since TIMESTAMPTZ
+            )
+        `);
+
+        console.log("room_blocks and room_owners tables ready");
+        await clearExpiredEmptyRooms();
     } catch (err) {
         dbConnected = false;
         console.error("Database unavailable:", err.message);
     }
 }
+
+async function clearExpiredEmptyRooms() {
+    if (!dbConnected) return;
+
+    try {
+        const result = await pool.query(`
+            SELECT room_code
+            FROM room_owners
+            WHERE empty_since IS NOT NULL
+              AND empty_since <= NOW() - INTERVAL '5 minutes'
+        `);
+
+        for (const row of result.rows) {
+            await pool.query("DELETE FROM messages WHERE room_code = $1", [row.room_code]);
+            await pool.query("UPDATE room_owners SET empty_since = NULL WHERE room_code = $1", [row.room_code]);
+            console.log(`Automatically cleared chat for room ${row.room_code}`);
+        }
+    } catch (err) {
+        console.error("Expired room cleanup failed:", err.message);
+    }
+}
+
 initDatabase();
 
 function clean(value) {
@@ -52,6 +93,7 @@ function clean(value) {
 
 async function isBlocked(roomId, clientId) {
     if (!dbConnected) return false;
+
     try {
         const result = await pool.query(
             "SELECT 1 FROM room_blocks WHERE room_code = $1 AND client_id = $2 LIMIT 1",
@@ -62,6 +104,112 @@ async function isBlocked(roomId, clientId) {
         console.error("Block check failed:", err.message);
         return false;
     }
+}
+
+async function getRoomOwner(roomId) {
+    if (!dbConnected) return null;
+
+    try {
+        const result = await pool.query(
+            "SELECT owner_client_id FROM room_owners WHERE room_code = $1",
+            [roomId]
+        );
+        return result.rows[0]?.owner_client_id || null;
+    } catch (err) {
+        console.error("Room owner lookup failed:", err.message);
+        return null;
+    }
+}
+
+async function ensureRoomOwner(roomId, clientId) {
+    if (!dbConnected) return null;
+
+    try {
+        // Only the first client ever entering this room becomes its owner.
+        // Later joins can never replace the owner.
+        await pool.query(
+            `INSERT INTO room_owners (room_code, owner_client_id)
+             VALUES ($1, $2)
+             ON CONFLICT (room_code) DO NOTHING`,
+            [roomId, clientId]
+        );
+
+        return await getRoomOwner(roomId);
+    } catch (err) {
+        console.error("Room owner creation failed:", err.message);
+        return null;
+    }
+}
+
+async function markRoomActive(roomId) {
+    if (!dbConnected) return;
+    try {
+        await pool.query(
+            "UPDATE room_owners SET empty_since = NULL WHERE room_code = $1",
+            [roomId]
+        );
+    } catch (err) {
+        console.error("Could not mark room active:", err.message);
+    }
+}
+
+async function markRoomEmpty(roomId) {
+    if (!dbConnected) return;
+
+    try {
+        await pool.query(
+            "UPDATE room_owners SET empty_since = NOW() WHERE room_code = $1",
+            [roomId]
+        );
+    } catch (err) {
+        console.error("Could not mark room empty:", err.message);
+    }
+}
+
+function cancelEmptyRoomTimer(roomId) {
+    if (emptyRoomTimers[roomId]) {
+        clearTimeout(emptyRoomTimers[roomId]);
+        delete emptyRoomTimers[roomId];
+    }
+}
+
+function scheduleEmptyRoomClear(roomId) {
+    cancelEmptyRoomTimer(roomId);
+
+    emptyRoomTimers[roomId] = setTimeout(async () => {
+        delete emptyRoomTimers[roomId];
+
+        // Someone may have rejoined during the five-minute window.
+        if (roomUsers[roomId]?.length) return;
+
+        try {
+            if (dbConnected) {
+                const result = await pool.query(
+                    `SELECT empty_since FROM room_owners WHERE room_code = $1`,
+                    [roomId]
+                );
+
+                const emptySince = result.rows[0]?.empty_since;
+                if (!emptySince) return;
+
+                const elapsed = Date.now() - new Date(emptySince).getTime();
+                if (elapsed < EMPTY_ROOM_CLEAR_MS) {
+                    scheduleEmptyRoomClear(roomId);
+                    return;
+                }
+
+                await pool.query("DELETE FROM messages WHERE room_code = $1", [roomId]);
+                await pool.query(
+                    "UPDATE room_owners SET empty_since = NULL WHERE room_code = $1",
+                    [roomId]
+                );
+
+                console.log(`Automatically cleared chat for room ${roomId} after 5 minutes empty`);
+            }
+        } catch (err) {
+            console.error("Automatic chat clear failed:", err.message);
+        }
+    }, EMPTY_ROOM_CLEAR_MS);
 }
 
 function getRoomUsers(roomId) {
@@ -89,6 +237,7 @@ app.get("/messages/:room", async (req, res) => {
     try {
         const room = req.params.room;
         if (!roomRegex.test(room)) return res.status(400).json([]);
+
         const result = await pool.query(
             `SELECT * FROM messages WHERE room_code = $1 ORDER BY created_at ASC`,
             [room]
@@ -116,13 +265,16 @@ io.on("connection", (socket) => {
         const clientId = clean(data.clientId);
 
         if (!roomRegex.test(roomId)) {
-            socket.emit("join-failure", "Invalid Room ID."); return;
+            socket.emit("join-failure", "Invalid Room ID.");
+            return;
         }
         if (!usernameRegex.test(username)) {
-            socket.emit("join-failure", "Invalid Username."); return;
+            socket.emit("join-failure", "Invalid Username.");
+            return;
         }
         if (!clientIdRegex.test(clientId)) {
-            socket.emit("join-failure", "Invalid client ID."); return;
+            socket.emit("join-failure", "Invalid client ID.");
+            return;
         }
 
         if (await isBlocked(roomId, clientId)) {
@@ -141,16 +293,38 @@ io.on("connection", (socket) => {
             return;
         }
 
-        const role = roomUsers[roomId].length === 0 ? "admin" : "member";
+        const ownerClientId = await ensureRoomOwner(roomId, clientId);
+        if (!ownerClientId) {
+            socket.emit("join-failure", "Could not determine the room creator. Please try again.");
+            return;
+        }
+
+        // Joining cancels the five-minute empty-room countdown.
+        cancelEmptyRoomTimer(roomId);
+        await markRoomActive(roomId);
+
+        // Admin is ALWAYS the original room creator.
+        // If the creator reconnects while members are already inside,
+        // everyone else remains a normal member.
+        const isCreator = clientId === ownerClientId;
+        const role = isCreator ? "admin" : "member";
+
+        if (isCreator) {
+            roomUsers[roomId].forEach(u => {
+                u.role = "member";
+            });
+        }
+
         const user = { socketId: socket.id, clientId, username, role };
         roomUsers[roomId].push(user);
+
         socket.join(roomId);
         socket.roomId = roomId;
         socket.username = username;
         socket.clientId = clientId;
         socket.role = role;
 
-        socket.emit("join-success", { role, clientId });
+        socket.emit("join-success", { role, clientId, ownerClientId });
         broadcastRoomState(roomId);
         socket.to(roomId).emit("system-message", `${username} joined`);
         console.log(`${username} joined ${roomId} as ${role}`);
@@ -167,19 +341,22 @@ io.on("connection", (socket) => {
     socket.on("send-message", async (data) => {
         try {
             if (!socket.roomId || !socket.username || !data?.message) return;
+
             const rawMessage = clean(data.message);
             if (!rawMessage) return;
 
             const now = Date.now();
             if (!rateLimiter[socket.id]) rateLimiter[socket.id] = [];
             rateLimiter[socket.id] = rateLimiter[socket.id].filter(t => now - t < 3000);
+
             if (rateLimiter[socket.id].length >= 5) {
                 socket.emit("system-message", "You are sending messages too fast.");
                 return;
             }
-            rateLimiter[socket.id].push(now);
 
+            rateLimiter[socket.id].push(now);
             const message = rawMessage.substring(0, 1000);
+
             io.to(socket.roomId).emit("receive-message", {
                 sender: socket.username,
                 message
@@ -193,15 +370,18 @@ io.on("connection", (socket) => {
             } catch (dbErr) {
                 console.error("Database insert failed:", dbErr.message);
             }
-        } catch (err) { console.error(err); }
+        } catch (err) {
+            console.error(err);
+        }
     });
 
     socket.on("clear-chat", async () => {
         try {
             if (!socket.roomId || socket.role !== "admin") {
-                socket.emit("admin-error", "Only the room admin can clear chat.");
+                socket.emit("admin-error", "Only the room creator can clear chat.");
                 return;
             }
+
             await pool.query("DELETE FROM messages WHERE room_code = $1", [socket.roomId]);
             io.to(socket.roomId).emit("chat-cleared");
         } catch (err) {
@@ -212,8 +392,10 @@ io.on("connection", (socket) => {
 
     socket.on("admin-kick", (data) => {
         if (socket.role !== "admin" || !socket.roomId) return;
+
         const target = findUser(socket.roomId, clean(data?.clientId));
         if (!target || target.clientId === socket.clientId || target.role === "admin") return;
+
         const targetSocket = io.sockets.sockets.get(target.socketId);
         if (targetSocket) {
             targetSocket.emit("kicked", "You were kicked from this room by the admin.");
@@ -223,13 +405,18 @@ io.on("connection", (socket) => {
 
     socket.on("admin-block", async (data) => {
         if (socket.role !== "admin" || !socket.roomId) return;
+
         const target = findUser(socket.roomId, clean(data?.clientId));
         if (!target || target.clientId === socket.clientId || target.role === "admin") return;
+
         try {
             await pool.query(
-                `INSERT INTO room_blocks (room_code, client_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+                `INSERT INTO room_blocks (room_code, client_id)
+                 VALUES ($1, $2)
+                 ON CONFLICT DO NOTHING`,
                 [socket.roomId, target.clientId]
             );
+
             const targetSocket = io.sockets.sockets.get(target.socketId);
             if (targetSocket) {
                 targetSocket.emit("blocked", "You were blocked from this room by the admin.");
@@ -243,8 +430,10 @@ io.on("connection", (socket) => {
 
     socket.on("admin-unblock", async (data) => {
         if (socket.role !== "admin" || !socket.roomId) return;
+
         const clientId = clean(data?.clientId);
         if (!clientId) return;
+
         try {
             await pool.query(
                 "DELETE FROM room_blocks WHERE room_code = $1 AND client_id = $2",
@@ -259,6 +448,7 @@ io.on("connection", (socket) => {
 
     socket.on("admin-get-blocks", async () => {
         if (socket.role !== "admin" || !socket.roomId) return;
+
         try {
             const result = await pool.query(
                 "SELECT client_id FROM room_blocks WHERE room_code = $1 ORDER BY blocked_at DESC",
@@ -270,26 +460,32 @@ io.on("connection", (socket) => {
         }
     });
 
-    socket.on("disconnect", () => {
+    socket.on("disconnect", async () => {
         const roomId = socket.roomId;
         if (rateLimiter[socket.id]) delete rateLimiter[socket.id];
         if (!roomId || !roomUsers[roomId]) return;
 
         socket.to(roomId).emit("typing", { username: socket.username, isTyping: false });
+
         const index = roomUsers[roomId].findIndex(u => u.socketId === socket.id);
         if (index === -1) return;
-        const wasAdmin = roomUsers[roomId][index].role === "admin";
+
         const username = roomUsers[roomId][index].username;
+        const clientId = roomUsers[roomId][index].clientId;
         roomUsers[roomId].splice(index, 1);
 
+        // IMPORTANT: never transfer admin to another user.
+        // The original room creator remains the only admin.
         if (roomUsers[roomId].length === 0) {
             delete roomUsers[roomId];
+            await markRoomEmpty(roomId);
+            scheduleEmptyRoomClear(roomId);
         } else {
-            if (wasAdmin) roomUsers[roomId][0].role = "admin";
             broadcastRoomState(roomId);
             socket.to(roomId).emit("system-message", `${username} left`);
         }
-        console.log(`${username} disconnected from ${roomId}`);
+
+        console.log(`${username} (${clientId}) disconnected from ${roomId}`);
     });
 });
 
