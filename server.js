@@ -40,10 +40,14 @@ async function initDatabase() {
             CREATE TABLE IF NOT EXISTS room_blocks (
                 room_code TEXT NOT NULL,
                 client_id TEXT NOT NULL,
+                username TEXT,
                 blocked_at TIMESTAMPTZ DEFAULT NOW(),
                 PRIMARY KEY (room_code, client_id)
             )
         `);
+
+        // Keep existing installations compatible with the original table.
+        await pool.query(`ALTER TABLE room_blocks ADD COLUMN IF NOT EXISTS username TEXT`);
 
         // Permanent room ownership. The owner is identified by the
         // anonymous clientId stored in that browser's localStorage.
@@ -278,6 +282,21 @@ io.on("connection", (socket) => {
         }
 
         if (await isBlocked(roomId, clientId)) {
+            // Keep the blocked user's most recently used username up to date.
+            // This also repairs older block records that were created before
+            // usernames were stored separately from client IDs.
+            if (dbConnected) {
+                try {
+                    await pool.query(
+                        `UPDATE room_blocks
+                         SET username = $3
+                         WHERE room_code = $1 AND client_id = $2`,
+                        [roomId, clientId, username]
+                    );
+                } catch (err) {
+                    console.error("Could not update blocked username:", err.message);
+                }
+            }
             socket.emit("join-failure", "You are blocked from this room.");
             return;
         }
@@ -397,6 +416,16 @@ io.on("connection", (socket) => {
         if (!target || target.clientId === socket.clientId || target.role === "admin") return;
 
         const targetSocket = io.sockets.sockets.get(target.socketId);
+
+        // Remove the target from our room state BEFORE disconnecting the socket.
+        // This prevents a fast rejoin from seeing "already connected" while
+        // Socket.IO is still finishing the disconnect event.
+        roomUsers[socket.roomId] = roomUsers[socket.roomId].filter(
+            u => u.socketId !== target.socketId
+        );
+        broadcastRoomState(socket.roomId);
+        socket.to(socket.roomId).emit("system-message", `${target.username} was kicked`);
+
         if (targetSocket) {
             targetSocket.emit("kicked", "You were kicked from this room by the admin.");
             targetSocket.disconnect(true);
@@ -409,15 +438,39 @@ io.on("connection", (socket) => {
         const target = findUser(socket.roomId, clean(data?.clientId));
         if (!target || target.clientId === socket.clientId || target.role === "admin") return;
 
+        const roomId = socket.roomId;
+        const targetClientId = target.clientId;
+        const targetUsername = target.username;
+        const targetSocket = io.sockets.sockets.get(target.socketId);
+
         try {
             await pool.query(
-                `INSERT INTO room_blocks (room_code, client_id)
-                 VALUES ($1, $2)
-                 ON CONFLICT DO NOTHING`,
-                [socket.roomId, target.clientId]
+                `INSERT INTO room_blocks (room_code, client_id, username)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (room_code, client_id)
+                 DO UPDATE SET username = EXCLUDED.username, blocked_at = NOW()`,
+                [roomId, targetClientId, targetUsername]
             );
 
-            const targetSocket = io.sockets.sockets.get(target.socketId);
+            // Remove the target immediately so the room state and rejoin check
+            // are updated before the client's disconnect finishes.
+            roomUsers[roomId] = roomUsers[roomId].filter(
+                u => u.socketId !== target.socketId
+            );
+
+            broadcastRoomState(roomId);
+            io.to(roomId).emit("system-message", `${targetUsername} was blocked`);
+
+            // Update the admin's blocked list immediately—no reload required.
+            const result = await pool.query(
+                `SELECT client_id AS "clientId", username
+                 FROM room_blocks
+                 WHERE room_code = $1
+                 ORDER BY blocked_at DESC`,
+                [roomId]
+            );
+            socket.emit("blocked-list", result.rows);
+
             if (targetSocket) {
                 targetSocket.emit("blocked", "You were blocked from this room by the admin.");
                 targetSocket.disconnect(true);
@@ -451,10 +504,13 @@ io.on("connection", (socket) => {
 
         try {
             const result = await pool.query(
-                "SELECT client_id FROM room_blocks WHERE room_code = $1 ORDER BY blocked_at DESC",
+                `SELECT client_id AS "clientId", username
+                 FROM room_blocks
+                 WHERE room_code = $1
+                 ORDER BY blocked_at DESC`,
                 [socket.roomId]
             );
-            socket.emit("blocked-list", result.rows.map(r => r.client_id));
+            socket.emit("blocked-list", result.rows);
         } catch (err) {
             socket.emit("admin-error", "Could not load blocked users.");
         }
