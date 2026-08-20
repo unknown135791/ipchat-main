@@ -37,7 +37,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     let typingTimeout = null, localIsTyping = false, cooldownActive = false, joined = false, isAdmin = false;
-    let blockedIds = [];
+    let blockedUsersData = [];
 
     function hideLoading() {
         if (loadingOverlay) loadingOverlay.classList.add("hidden");
@@ -175,23 +175,48 @@ document.addEventListener("DOMContentLoaded", () => {
     socket.on("room-state", data => renderUsers(data.users || []));
     socket.on("user-list", users => { if (!users || !users.length) return; /* room-state renders admin controls */ });
 
-    function renderBlocked(ids) {
-        blockedIds = ids || [];
+    function renderBlocked(users) {
+        blockedUsersData = Array.isArray(users) ? users : [];
         if (!isAdmin || !blockedUsers) return;
         blockedUsers.innerHTML = "";
-        if (!blockedIds.length) { blockedUsers.textContent = "No blocked users"; return; }
-        blockedIds.forEach(id => {
-            const row = document.createElement("div"); row.className = "blocked-row";
-            const label = document.createElement("span"); label.textContent = id.slice(0, 12) + "…";
-            const btn = document.createElement("button"); btn.className = "user-action unblock"; btn.textContent = "Unblock"; btn.onclick = () => socket.emit("admin-unblock", { clientId: id });
-            row.append(label, btn); blockedUsers.appendChild(row);
+        if (!blockedUsersData.length) {
+            blockedUsers.textContent = "No blocked users";
+            return;
+        }
+
+        blockedUsersData.forEach(user => {
+            const row = document.createElement("div");
+            row.className = "blocked-row";
+
+            const label = document.createElement("span");
+            // Always prefer the username saved at the moment of blocking.
+            // The client ID is only a fallback for legacy/corrupt records.
+            label.textContent = user.username || "Unknown user";
+
+            const btn = document.createElement("button");
+            btn.className = "user-action unblock";
+            btn.textContent = "Unblock";
+            btn.onclick = () => socket.emit("admin-unblock", { clientId: user.clientId });
+
+            row.append(label, btn);
+            blockedUsers.appendChild(row);
         });
     }
     socket.on("blocked-list", renderBlocked);
     socket.on("admin-info", msg => { alert(msg); if (isAdmin) socket.emit("admin-get-blocks"); });
     socket.on("admin-error", msg => alert(msg));
-    socket.on("kicked", msg => { alert(msg); window.location.href = `/index.html?error=${encodeURIComponent(msg)}`; });
-    socket.on("blocked", msg => { alert(msg); window.location.href = `/index.html?error=${encodeURIComponent(msg)}`; });
+    socket.on("kicked", msg => {
+        joined = false;
+        alert(msg);
+        socket.disconnect();
+        window.location.href = `/index.html?error=${encodeURIComponent(msg)}`;
+    });
+    socket.on("blocked", msg => {
+        joined = false;
+        alert(msg);
+        socket.disconnect();
+        window.location.href = `/index.html?error=${encodeURIComponent(msg)}`;
+    });
 
     socket.on("system-message", msg => {
         document.getElementById("emptyState")?.remove();
