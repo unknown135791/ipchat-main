@@ -27,7 +27,7 @@ const usernameRegex = /^[a-zA-Z0-9_ -]{1,20}$/;
 const roomRegex = /^[a-zA-Z0-9_-]{1,20}$/;
 const clientIdRegex = /^[a-zA-Z0-9_-]{8,100}$/;
 
-const EMPTY_ROOM_CLEAR_MS = 5 * 60 * 1000;
+const EMPTY_ROOM_CLEAR_MS = 1 * 60 * 1000;
 let dbConnected = false;
 
 async function initDatabase() {
@@ -76,13 +76,14 @@ async function clearExpiredEmptyRooms() {
             SELECT room_code
             FROM room_owners
             WHERE empty_since IS NOT NULL
-              AND empty_since <= NOW() - INTERVAL '5 minutes'
+              AND empty_since <= NOW() - INTERVAL '1 minute'
         `);
 
         for (const row of result.rows) {
             await pool.query("DELETE FROM messages WHERE room_code = $1", [row.room_code]);
-            await pool.query("UPDATE room_owners SET empty_since = NULL WHERE room_code = $1", [row.room_code]);
-            console.log(`Automatically cleared chat for room ${row.room_code}`);
+            await pool.query("DELETE FROM room_blocks WHERE room_code = $1", [row.room_code]);
+            await pool.query("DELETE FROM room_owners WHERE room_code = $1", [row.room_code]);
+            console.log(`Automatically cleared room data for room ${row.room_code}`);
         }
     } catch (err) {
         console.error("Expired room cleanup failed:", err.message);
@@ -183,7 +184,7 @@ function scheduleEmptyRoomClear(roomId) {
     emptyRoomTimers[roomId] = setTimeout(async () => {
         delete emptyRoomTimers[roomId];
 
-        // Someone may have rejoined during the five-minute window.
+        // Someone may have rejoined during the one-minute window.
         if (roomUsers[roomId]?.length) return;
 
         try {
@@ -203,12 +204,10 @@ function scheduleEmptyRoomClear(roomId) {
                 }
 
                 await pool.query("DELETE FROM messages WHERE room_code = $1", [roomId]);
-                await pool.query(
-                    "UPDATE room_owners SET empty_since = NULL WHERE room_code = $1",
-                    [roomId]
-                );
+                await pool.query("DELETE FROM room_blocks WHERE room_code = $1", [roomId]);
+                await pool.query("DELETE FROM room_owners WHERE room_code = $1", [roomId]);
 
-                console.log(`Automatically cleared chat for room ${roomId} after 5 minutes empty`);
+                console.log(`Automatically cleared room data for room ${roomId} after 1 minute empty`);
             }
         } catch (err) {
             console.error("Automatic chat clear failed:", err.message);
